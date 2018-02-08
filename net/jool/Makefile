@@ -71,25 +71,45 @@ define Package/jool/description
   $(call Package/jool/Default/description)
 endef
 
-define KernelPackage/jool
+define KernelPackage/jool/Default
   SECTION:=kernel
   CATEGORY:=Kernel modules
   SUBMENU:=Network Support
-  TITLE:=Jool kernel module
   DEPENDS:= \
     @IPV6 \
     +kmod-crypto-md5 \
     +kmod-nf-conntrack \
     +kmod-nf-conntrack6
-  FILES:= \
-    $(PKG_BUILD_DIR)/mod/stateful/jool.$(LINUX_KMOD_SUFFIX) \
-    $(PKG_BUILD_DIR)/mod/stateless/jool_siit.$(LINUX_KMOD_SUFFIX)
 endef
 
-define KernelPackage/jool/description
+define Package/jool
+  $(call Package/jool/Default)
+  TITLE:=Jool kernel modules meta-package
+  DEPENDS:=+kmod-jool-stateful +kmod-jool-stateless
+endef
+
+define KernelPackage/jool-stateful
+  $(call KernelPackage/jool/Default)
+  TITLE:=Jool stateful kernel module
+  FILES:=$(PKG_BUILD_DIR)/mod/stateful/jool.$(LINUX_KMOD_SUFFIX)
+endef
+
+define KernelPackage/jool-stateful/description
   $(call Package/jool/Default/description)
 
-  This package provides the kernel module for Jool.
+  This package provides only the stateful kernel module for Jool.
+endef
+
+define KernelPackage/jool-stateless
+  $(call KernelPackage/jool/Default)
+  TITLE:=Jool stateless kernel module
+  FILES:=$(PKG_BUILD_DIR)/mod/stateless/jool_siit.$(LINUX_KMOD_SUFFIX)
+endef
+
+define KernelPackage/jool-stateless/description
+  $(call Package/jool/Default/description)
+
+  This package provides only the stateless kernel module for Jool.
 endef
 
 define Package/jool-tools
@@ -112,4 +132,6 @@ endef
 
 $(eval $(call BuildPackage,jool))
 $(eval $(call KernelPackage,jool))
+$(eval $(call KernelPackage,jool-stateful))
+$(eval $(call KernelPackage,jool-stateless))
 $(eval $(call BuildPackage,jool-tools))
