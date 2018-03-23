@@ -103,7 +103,7 @@ static int siit_release(struct net_device *dev)
  *                included IP packet, else = 0
  */
 
-static int ip4_ip6(char *src, int len, char *dst, int include_flag)
+static int ip4_ip6(char *src, int len, char *dst, int include_flag, unsigned char *mac)
 {
 	struct iphdr *ih4 = (struct iphdr *) src; /* point to current IPv4 header struct */
 	struct icmphdr *icmp_hdr;   /* point to current ICMPv4 header struct */
@@ -231,6 +231,7 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag)
 		ih6->daddr.in6_u.u6_addr32[1] = 0;
 		ih6->daddr.in6_u.u6_addr32[2] = htonl(MAPPED_PREFIX); /* to network order bytes */
 		ih6->daddr.in6_u.u6_addr32[3] = ih4->daddr;
+
 	}
 	else {
 
@@ -241,10 +242,13 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag)
 		   is IPv4-mapped address (but it's not IPv4- mapped, we use
 		   prefix ::ffff:ffff:0:0/96)
 		*/
-		ih6->saddr.in6_u.u6_addr32[0] = 0;
-		ih6->saddr.in6_u.u6_addr32[1] = 0;
-		ih6->saddr.in6_u.u6_addr32[2] = htonl(MAPPED_PREFIX); /* to network order bytes */
-		ih6->saddr.in6_u.u6_addr32[3] = ih4->saddr;
+		ih6->saddr.in6_u.u6_addr32[0] = htonl(0xfddd1337);
+		ih6->saddr.in6_u.u6_addr32[1] = htonl(0x13371337);
+		ih6->saddr.in6_u.u6_addr16[4] = htons(((mac[0] ^ 0x02) << 8) & mac[1]);
+		ih6->saddr.in6_u.u6_addr16[5] = htons((mac[2] << 8) & 0xff);
+		ih6->saddr.in6_u.u6_addr16[6] = htons(0xfe00 & mac[3]);
+		ih6->saddr.in6_u.u6_addr16[7] = htons((mac[4] << 8) & mac[5]);
+
 
 		/* Destination address
 		   is is IPv4-translated IPv6 address
@@ -403,7 +407,7 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag)
 			/* Call our ip4_ip6() to translate included IP packet */
 			if (ip4_ip6(src+hdr_len+sizeof(struct icmphdr), len - hdr_len - sizeof(struct icmphdr),
 						dst+sizeof(struct ipv6hdr)+fr_flag*sizeof(struct frag_hdr)
-						+sizeof(struct icmp6hdr), 1) == -1) {
+						+sizeof(struct icmp6hdr), 1, mac) == -1) {
 				PDEBUG("ip4_ip6(): Uncorrect translation of ICMPv4 Error message - packet dropped.\n");
 				return -1;
 			}
@@ -495,7 +499,7 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag)
  *
  */
 
-static int ip6_ip4(char *src, int len, char *dst, int include_flag)
+static int ip6_ip4(char *src, int len, char *dst, int include_flag, unsigned char *mac)
 {
 	struct ipv6hdr *ip6_hdr;    /* point to current IPv6 header struct */
 	struct iphdr *ip_hdr;       /* point to current IPv4 header struct */
@@ -756,8 +760,15 @@ static int ip6_ip4(char *src, int len, char *dst, int include_flag)
 
 	/* IPv4 Src addr = last 4 bytes from IPv6 Src addr */
 	ip_hdr->saddr = ip6_hdr->saddr.s6_addr32[3];
-	/* IPv4 Dst addr = last 4 bytes from IPv6 Dst addr */
-	ip_hdr->daddr = ip6_hdr->daddr.s6_addr32[3];
+	/* IPv4 Dst addr = fixed value at the moment */
+	ip_hdr->daddr = htonl(0x0a7e000a); // 10.126.0.10
+	/* Retrieve MAC address from IPv6 Dest Addr */
+	mac[0] = (* ((unsigned char *)&ip6_hdr->daddr.s6_addr16[4])) ^ 0x02;
+	mac[1] = * ((unsigned char *)&ip6_hdr->daddr.s6_addr16[4]+1);
+	mac[2] = * ((unsigned char *)&ip6_hdr->daddr.s6_addr16[5]);
+	mac[3] = * ((unsigned char *)&ip6_hdr->daddr.s6_addr16[6]+1);
+	mac[4] = * ((unsigned char *)&ip6_hdr->daddr.s6_addr16[7]);
+	mac[5] = * ((unsigned char *)&ip6_hdr->daddr.s6_addr16[7]+1);
 
 	/* Calculate IPv4 header checksum */
 	ip_hdr->check = 0;
@@ -921,7 +932,7 @@ static int ip6_ip4(char *src, int len, char *dst, int include_flag)
 					if (len_delta >= sizeof(struct ipv6hdr))
 					{
 						if((inc_opts_len = ip6_ip4((char *)icmp6_hdr + sizeof(struct icmp6hdr), len_delta,
-										           (char *)icmp_hdr + sizeof(struct icmphdr), 1)) == -1) {
+										           (char *)icmp_hdr + sizeof(struct icmphdr), 1, mac)) == -1) {
 							PDEBUG("ip6_ip4(): incorrect translation of ICMPv6 Error message, packet dropped\n");
 							return -1;
 						}
@@ -1092,7 +1103,7 @@ static int ip4_fragment(struct sk_buff *skb, int len, int hdr_len, struct net_de
 		skb2->protocol = htons(ETH_P_IPV6);
 
 		/* call translation function */
-		if ( ip4_ip6(buff, frag_len+hdr_len, skb2->data, 0) == -1) {
+		if ( ip4_ip6(buff, frag_len+hdr_len, skb2->data, 0, eth_h->h_source) == -1) {
 			dev_kfree_skb(skb2);
 			return -1;
 		}
@@ -1156,6 +1167,7 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 	int len;                    /* original packets length */
 	int new_packet_len;
 	int skb_delta = 0;          /* delta size for allocate new skb */
+	unsigned char mac[6];
 	char new_packet_buff[2048];
 
 	/* Check pointer to sk_buff and device structs */
@@ -1291,7 +1303,7 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 		skb2->protocol = htons(ETH_P_IPV6);
 
 		/* call translation function */
-		if (ip4_ip6(skb->data, len, skb2->data, 0) == -1 ) {
+		if (ip4_ip6(skb->data, len, skb2->data, 0, eth_h->h_source) == -1 ) {
 			dev_kfree_skb(skb);
 			dev_kfree_skb(skb2);
 			siit_stats(dev)->rx_errors++;
@@ -1311,7 +1323,7 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 		len = skb->len;
 
 		/* call translation function */
-		if ((new_packet_len = ip6_ip4(skb->data, len, new_packet_buff, 0)) == -1 )
+		if ((new_packet_len = ip6_ip4(skb->data, len, new_packet_buff, 0, (unsigned char *) &mac)) == -1 )
 		{
 			PDEBUG("siit_xmit(): error translation ipv6->ipv4, packet dropped.\n");
 			siit_stats(dev)->rx_dropped++;
@@ -1328,6 +1340,8 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 		memcpy(skb_put(skb2, new_packet_len + dev->hard_header_len), (char *)eth_h, dev->hard_header_len);
 		eth_h = (struct ethhdr *)skb2->data;
 		eth_h->h_proto = htons(ETH_P_IP);
+		memcpy(eth_h->h_dest, &mac, 6);
+		memcpy(eth_h->h_source, dev->dev_addr, 6);
 		skb_reset_mac_header(skb2);
 		skb_pull(skb2, dev->hard_header_len);
 		memcpy(skb2->data, new_packet_buff, new_packet_len);
