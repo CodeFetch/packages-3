@@ -28,7 +28,10 @@
 #include <asm/checksum.h>
 #include <net/ip6_checksum.h>
 #include <linux/in6.h>
+#include <linux/if_arp.h>
+#include <net/arp.h>
 #include "siit.h"
+
 
 MODULE_AUTHOR("Dmitriy Moscalev, Grigory Klyuchnikov, Felix Fietkau");
 
@@ -37,6 +40,9 @@ MODULE_AUTHOR("Dmitriy Moscalev, Grigory Klyuchnikov, Felix Fietkau");
  * from origin paket and set it to 0
  */
 int tos_ignore_flag = 0;
+
+static struct net_device *siit_dev4 = NULL;
+static struct net_device *siit_dev6 = NULL;
 
 #define siit_stats(_dev) (&(_dev)->stats)
 
@@ -236,13 +242,11 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag, unsigned cha
 	else {
 		if((ih4->saddr & htonl(IPRANGE)) != htonl(IPRANGE)) { 
 			PDEBUG("ip4_ip6(): Src address not in local IPv4 range: %d.%d.%d.%d, packet dropped.\n",
-					   htonl(ih4->saddr[0]), htonl(ih4->saddr[1]),
-					   htonl(ih4->saddr[2]), htonl(ih4->saddr[3]));
+					NIPQUAD(ih4->saddr));
 			return -1;
 		} else if((ih4->daddr & htonl(IPRANGE)) == htonl(IPRANGE)) {
 			PDEBUG("ip4_ip6(): Dst address in local IPv4 range: %d.%d.%d.%d, packet dropped.\n",
-					   htonl(ih4->daddr[0]), htonl(ih4->daddr[1]),
-					   htonl(ih4->daddr[2]), htonl(ih4->daddr[3]));
+					NIPQUAD(ih4->daddr));
 			return -1;
 		}
 		/*
@@ -771,7 +775,7 @@ static int ip6_ip4(char *src, int len, char *dst, int include_flag, unsigned cha
 	/* IPv4 Src addr = last 4 bytes from IPv6 Src addr */
 	ip_hdr->saddr = ip6_hdr->saddr.s6_addr32[3];
 	/* IPv4 Dst addr = fixed value at the moment */
-	ip_hdr->daddr = htonl(0x0a7e000a); // 10.126.0.10
+	ip_hdr->daddr = htonl(IPADDR);
 	/* Retrieve MAC address from IPv6 Dest Addr */
 	mac[0] = (* ((unsigned char *)&ip6_hdr->daddr.s6_addr16[4])) ^ 0x02;
 	mac[1] = * ((unsigned char *)&ip6_hdr->daddr.s6_addr16[4]+1);
@@ -1174,6 +1178,9 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct sk_buff *skb2 = NULL;/* pointer to new struct sk_buff for transleded packet */
 	struct ethhdr *eth_h;       /* pointer to incoming Ether header */
+	struct arphdr *arp_header; // points to arp header
+	struct iphdr *ip_hdr; // used for ARP points to (nonexistent) IP header - only used to calculate checksum
+	char tmp[10];
 	int len;                    /* original packets length */
 	int new_packet_len;
 	int skb_delta = 0;          /* delta size for allocate new skb */
@@ -1222,8 +1229,63 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 	skb_pull(skb,dev->hard_header_len);
 
 	/*
-	 * Process IPv4 paket
+	 * Process IPv4 packet
 	 */
+	if (unlikely(ntohs(skb->protocol) == ETH_P_ARP)) {
+
+		if (memcmp(dev->dev_addr, siit_dev4->dev_addr, ETH_ALEN) != 0)
+		{
+			PDEBUG("siit_xmit(): siit6 device does not accept ARP packets, packet dropped.\n");
+			siit_stats(dev)->rx_dropped++;
+			dev_kfree_skb(skb);
+			return 0;
+		}
+		arp_header = arp_hdr(skb);
+		if(arp_header->ar_op != ARPOP_REQUEST) {
+			// we are not interested
+			siit_stats(dev)->rx_dropped++;
+			dev_kfree_skb(skb);
+			return 0;
+		}
+
+		skb2 = dev_alloc_skb(len+dev->hard_header_len+skb_delta);
+		if (!skb2) {
+			printk(KERN_DEBUG "%s: alloc_skb failure - packet dropped.\n", dev->name);
+			dev_kfree_skb(skb);
+			siit_stats(dev)->rx_dropped++;
+
+			return 0;
+		}
+		/* allocate skb->data portion = IPv4 packet len + ether header len
+		 * and copy to head of skb->data ether header from origin skb
+		 */
+		memcpy(skb_put(skb2, len+dev->hard_header_len), (char *)eth_h, dev->hard_header_len);
+		/* set destination l2 address to source l2 address */
+		eth_h = (struct ethhdr *)skb2->data;
+		eth_h->h_proto = htons(ETH_P_ARP);
+		memcpy(eth_h->h_dest, eth_h->h_source, dev->addr_len);
+		memcpy(eth_h->h_source, siit_dev4->dev_addr, ETH_ALEN);
+		skb_reset_mac_header(skb2);
+
+		/* remove ether header from new skb->data,
+		 * NOTE! data will rest, pointer to data and data len will change
+		 */
+		skb_pull(skb2, dev->hard_header_len);
+		/* set skb protocol to ARP */
+		skb2->protocol = htons(ETH_P_ARP);
+		ip_hdr = (struct iphdr *)skb2->data;
+		arp_header = arp_hdr(skb2);
+		arp_header->ar_op = htons(ARPOP_REPLY);
+		// copy old source hw/proto addr to tmp
+		memcpy(tmp, (char *)arp_header + ARP_SHA_OFFSET, 10);
+		// copy old destination hw/proto addr to source
+		memcpy((char *)arp_header + ARP_SHA_OFFSET, (void*)arp_header + ARP_THA_OFFSET, 10);
+		// copy old source hw/proto addr to destination
+		memcpy((char *)arp_header + ARP_THA_OFFSET, tmp, 10);
+		ip_hdr->check = 0;
+		ip_hdr->check = ip_fast_csum((unsigned char *)ip_hdr, ip_hdr->ihl);
+		skb2->dev = dev;
+	}
 	if (ntohs(skb->protocol) == ETH_P_IP) {
 		int hdr_len;            /* IPv4 header length */
 		int data_len;           /* IPv4 data length */
@@ -1231,6 +1293,14 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 		struct icmphdr *icmp_hdr;   /* point to current ICMPv4 header struct */
 
 		ih4 = (struct iphdr *)skb->data; /* point to incoming packet's IPv4 header */
+
+		if (memcmp(dev->dev_addr, siit_dev4->dev_addr, ETH_ALEN) != 0)
+		{
+			PDEBUG("siit_xmit(): siit6 device does not accept IPv4 packets, packet dropped.\n");
+			siit_stats(dev)->rx_dropped++;
+			dev_kfree_skb(skb);
+			return 0;
+		}
 
 		/* Check IPv4 Total Length */
 		if (skb->len != ntohs(ih4->tot_len)) {
@@ -1304,14 +1374,17 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 		/* correct ether header data, ether protocol field to ETH_P_IPV6 */
 		eth_h = (struct ethhdr *)skb2->data;
 		eth_h->h_proto = htons(ETH_P_IPV6);
+		memset(eth_h->h_dest, 0, ETH_ALEN);
+		memcpy(eth_h->h_source, siit_dev4->dev_addr, ETH_ALEN);
 		skb_reset_mac_header(skb2);
+
 		/* remove ether header from new skb->data,
 		 * NOTE! data will rest, pointer to data and data len will change
 		 */
 		skb_pull(skb2,dev->hard_header_len);
 		/* set skb protocol to IPV6 */
 		skb2->protocol = htons(ETH_P_IPV6);
-
+		
 		/* call translation function */
 		if (ip4_ip6(skb->data, len, skb2->data, 0, eth_h->h_source) == -1 ) {
 			dev_kfree_skb(skb);
@@ -1320,6 +1393,7 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 
 			return 0;
 		}
+		skb2->dev = siit_dev6;
 	}
 	/*
 	 * IPv6 paket
@@ -1331,6 +1405,13 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 #endif
 		/* packet len = skb->data len*/
 		len = skb->len;
+
+		if (memcmp(dev->dev_addr, siit_dev6->dev_addr, ETH_ALEN) != 0)
+		{
+			PDEBUG("siit_xmit(): siit4 device does not accept IPv6 packets, packet dropped.\n");
+			siit_stats(dev)->rx_dropped++;
+			goto end;
+		}
 
 		/* call translation function */
 		if ((new_packet_len = ip6_ip4(skb->data, len, new_packet_buff, 0, (unsigned char *) &mac)) == -1 )
@@ -1351,11 +1432,12 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 		eth_h = (struct ethhdr *)skb2->data;
 		eth_h->h_proto = htons(ETH_P_IP);
 		memcpy(eth_h->h_dest, &mac, ETH_ALEN);
-		memcpy(eth_h->h_source, dev->dev_addr, ETH_ALEN);
+		memcpy(eth_h->h_source, siit_dev4->dev_addr, ETH_ALEN);
 		skb_reset_mac_header(skb2);
 		skb_pull(skb2, dev->hard_header_len);
 		memcpy(skb2->data, new_packet_buff, new_packet_len);
 		skb2->protocol = htons(ETH_P_IP);
+		skb2->dev = siit_dev4;
 	}
 	else {
 		PDEBUG("siit_xmit(): unsupported protocol family %x, packet dropped.\n", skb->protocol);
@@ -1366,7 +1448,7 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 	 * Set needed fields in new sk_buff
 	 */
 	skb2->pkt_type = PACKET_HOST;
-	skb2->dev = dev;
+	
 	skb2->ip_summed = CHECKSUM_UNNECESSARY;
 
 	/* Add transmit statistic */
@@ -1382,6 +1464,7 @@ end:
 	return 0;
 }
 
+
 static bool header_ops_init = false;
 static struct header_ops siit_header_ops ____cacheline_aligned;
 
@@ -1396,30 +1479,35 @@ static const struct net_device_ops siit_netdev_ops = {
  * It is invoked by register_netdev()
  */
 
-static void
-siit_init(struct net_device *dev)
+static void siit_init(struct net_device *dev)
 {
+	int i;
 	ether_setup(dev);    /* assign some of the fields */
 	random_ether_addr(dev->dev_addr);
+
+	for (i=0 ; i < 6 ; i++) 
+		dev->broadcast[i] = (unsigned char)15;
+
+	dev->hard_header_len = 14;
 
 	/*
 	 * Assign device function.
 	 */
 	dev->netdev_ops = &siit_netdev_ops;
-	dev->flags           |= IFF_NOARP;     /* ARP not used */
 	dev->tx_queue_len = 10;
 
 	if (!header_ops_init) {
 		memcpy(&siit_header_ops, dev->header_ops, sizeof(struct header_ops));
 		siit_header_ops.cache = NULL;
 	}
+
 	dev->header_ops = &siit_header_ops;
 }
 
 /*
  * Finally, the module stuff
  */
-static struct net_device *siit_dev = NULL;
+
 
 int init_module(void)
 {
@@ -1428,30 +1516,45 @@ int init_module(void)
 
 	priv_size = sizeof(struct header_ops);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,17,0)
-	siit_dev = alloc_netdev(priv_size, "siit%d", NET_NAME_UNKNOWN, siit_init);
+	siit_dev4 = alloc_netdev(priv_size, "siit4%d", NET_NAME_UNKNOWN, siit_init);
+	siit_dev6 = alloc_netdev(priv_size, "siit6%d", NET_NAME_UNKNOWN, siit_init);
 #else
-	siit_dev = alloc_netdev(priv_size, "siit%d", siit_init);
+	siit_dev4 = alloc_netdev(priv_size, "siit4%d", siit_init);
+	siit_dev6 = alloc_netdev(priv_size, "siit6%d", siit_init);
 #endif
-	if (!siit_dev)
-		goto err_alloc;
+	if (!siit_dev4 || !siit_dev6)
+		goto err_device;
 
-	res = register_netdev(siit_dev);
-	if (res)
-		goto err_register;
+	res = register_netdev(siit_dev4);
+	if (res) {
+		free_netdev(siit_dev4);
+		goto err_device;
+		}
+
+	res = register_netdev(siit_dev6);
+	if (res) {
+		free_netdev(siit_dev4);
+		free_netdev(siit_dev6);
+		goto err_device;
+		}
 
 	return 0;
 
-err_register:
-	free_netdev(siit_dev);
-err_alloc:
-	printk(KERN_ERR "Error creating siit device: %d\n", res);
+err_device:
+	printk(KERN_ERR "Error creating siit devices: %d\n", res);
 	return res;
 }
 
 void cleanup_module(void)
 {
-	unregister_netdev(siit_dev);
-	free_netdev(siit_dev);
+	if (siit_dev4) {
+		unregister_netdev(siit_dev4);
+		free_netdev(siit_dev6);
+	}
+	if (siit_dev6) {
+		unregister_netdev(siit_dev6);
+		free_netdev(siit_dev6);
+	}
 }
 
 MODULE_LICENSE("GPL");
