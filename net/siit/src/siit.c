@@ -217,9 +217,9 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag, unsigned cha
 		   is IPv4-translated IPv6 address because packet traveled
 		   from IPv6 to IPv4 area
 		*/
-		ih6->saddr.in6_u.u6_addr32[0] = 0;
-		ih6->saddr.in6_u.u6_addr32[1] = 0;
-		ih6->saddr.in6_u.u6_addr32[2] = htonl(TRANSLATED_PREFIX); /* to network order bytes */
+		ih6->saddr.in6_u.u6_addr32[0] = htonl(TRANSLATED_PREFIX_A);
+		ih6->saddr.in6_u.u6_addr32[1] = htonl(TRANSLATED_PREFIX_B);
+		ih6->saddr.in6_u.u6_addr32[2] = htonl(TRANSLATED_PREFIX_C); /* to network order bytes */
 		ih6->saddr.in6_u.u6_addr32[3] = ih4->saddr;
 
 		/*
@@ -227,14 +227,24 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag, unsigned cha
 		   is IPv4-mapped address (but it's not IPv4- mapped, we use
 		   prefix ::ffff:ffff:0:0/96
 		 */
-		ih6->daddr.in6_u.u6_addr32[0] = 0;
-		ih6->daddr.in6_u.u6_addr32[1] = 0;
-		ih6->daddr.in6_u.u6_addr32[2] = htonl(MAPPED_PREFIX); /* to network order bytes */
+		ih6->daddr.in6_u.u6_addr32[0] = htonl(MAPPED_PREFIX_A);
+		ih6->daddr.in6_u.u6_addr32[1] = htonl(MAPPED_PREFIX_B);;
+		ih6->daddr.in6_u.u6_addr32[2] = htonl(0x1); /* to network order bytes */
 		ih6->daddr.in6_u.u6_addr32[3] = ih4->daddr;
 
 	}
 	else {
-
+		if((ih4->saddr & htonl(IPRANGE)) != htonl(IPRANGE)) { 
+			PDEBUG("ip4_ip6(): Src address not in local IPv4 range: %d.%d.%d.%d, packet dropped.\n",
+					   htonl(ih4->saddr[0]), htonl(ih4->saddr[1]),
+					   htonl(ih4->saddr[2]), htonl(ih4->saddr[3]));
+			return -1;
+		} else if((ih4->daddr & htonl(IPRANGE)) == htonl(IPRANGE)) {
+			PDEBUG("ip4_ip6(): Dst address in local IPv4 range: %d.%d.%d.%d, packet dropped.\n",
+					   htonl(ih4->daddr[0]), htonl(ih4->daddr[1]),
+					   htonl(ih4->daddr[2]), htonl(ih4->daddr[3]));
+			return -1;
+		}
 		/*
 		   This is normal case (packet isn't included IP packet)
 
@@ -242,20 +252,20 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag, unsigned cha
 		   is IPv4-mapped address (but it's not IPv4- mapped, we use
 		   prefix ::ffff:ffff:0:0/96)
 		*/
-		ih6->saddr.in6_u.u6_addr32[0] = htonl(0xfddd1337);
-		ih6->saddr.in6_u.u6_addr32[1] = htonl(0x13371337);
-		ih6->saddr.in6_u.u6_addr16[4] = htons(((mac[0] ^ 0x02) << 8) & mac[1]);
-		ih6->saddr.in6_u.u6_addr16[5] = htons((mac[2] << 8) & 0xff);
-		ih6->saddr.in6_u.u6_addr16[6] = htons(0xfe00 & mac[3]);
-		ih6->saddr.in6_u.u6_addr16[7] = htons((mac[4] << 8) & mac[5]);
+		ih6->saddr.in6_u.u6_addr32[0] = htonl(MAPPED_PREFIX_A);
+		ih6->saddr.in6_u.u6_addr32[1] = htonl(MAPPED_PREFIX_B);
+		ih6->saddr.in6_u.u6_addr16[4] = htons(((mac[0] ^ 0x02) << 8) | mac[1]);
+		ih6->saddr.in6_u.u6_addr16[5] = htons((mac[2] << 8) | 0xff);
+		ih6->saddr.in6_u.u6_addr16[6] = htons(0xfe00 | mac[3]);
+		ih6->saddr.in6_u.u6_addr16[7] = htons((mac[4] << 8) | mac[5]);
 
 
 		/* Destination address
-		   is is IPv4-translated IPv6 address
+		   is IPv4-translated IPv6 address
 		 */
-		ih6->daddr.in6_u.u6_addr32[0] = 0;
-		ih6->daddr.in6_u.u6_addr32[1] = 0;
-		ih6->daddr.in6_u.u6_addr32[2] = htonl(TRANSLATED_PREFIX); /* to network order bytes */
+		ih6->daddr.in6_u.u6_addr32[0] = htonl(TRANSLATED_PREFIX_A);
+		ih6->daddr.in6_u.u6_addr32[1] = htonl(TRANSLATED_PREFIX_B);
+		ih6->daddr.in6_u.u6_addr32[2] = htonl(TRANSLATED_PREFIX_C); /* to network order bytes */
 		ih6->daddr.in6_u.u6_addr32[3] = ih4->daddr;
 	}
 
@@ -445,7 +455,7 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag, unsigned cha
 				/* It's a first fragment */
 				if (udp_hdr->check == 0) {
 					/* System management event */
-					printk("siit: First fragment of UDP with zero checksum - packet droped\n");
+					printk("siit: First fragment of UDP with zero checksum - packet dropped\n");
 					printk("siit: addr: %x src port: %d dst port: %d\n",
 						   htonl(ih4->saddr), htons(udp_hdr->source), htons(udp_hdr->dest));
 					return -1;
@@ -526,13 +536,13 @@ static int ip6_ip4(char *src, int len, char *dst, int include_flag, unsigned cha
 		/* Check validation of Saddr & Daddr? is a packet to fall under our translation? */
 		if (include_flag) { /* It's ICMP included IP packet,
 							   about process include_flag see comment in ip4_ip6() */
-			if (ip6_hdr->saddr.s6_addr32[2] != htonl(MAPPED_PREFIX)) {
+			if (ip6_hdr->saddr.s6_addr32[0] != htonl(MAPPED_PREFIX_A) || ip6_hdr->saddr.s6_addr32[1] != htonl(MAPPED_PREFIX_B) || ip6_hdr->saddr.s6_addr32[2] != htonl(0x1)) {
 				PDEBUG("ip6_ip4(): Included IP packet Src addr isn't mapped addr: %x%x%x%x, packet dropped.\n",
 					   ip6_hdr->saddr.s6_addr32[0], ip6_hdr->saddr.s6_addr32[1],
 					   ip6_hdr->saddr.s6_addr32[2], ip6_hdr->saddr.s6_addr32[3]);
 				return -1;
 			}
-			if ( ip6_hdr->daddr.s6_addr32[2] != htonl(TRANSLATED_PREFIX)) {
+			if ( ip6_hdr->daddr.s6_addr32[2] != htonl(TRANSLATED_PREFIX_C) || ip6_hdr->daddr.s6_addr32[1] != htonl(TRANSLATED_PREFIX_B) || ip6_hdr->daddr.s6_addr32[0] != htonl(TRANSLATED_PREFIX_A)) {
 				PDEBUG("ip6_ip4(): Included IP packet Dst addr isn't translated addr: %x%x%x%x, packet dropped.\n",
 					   ip6_hdr->daddr.s6_addr32[0], ip6_hdr->daddr.s6_addr32[1],
 					   ip6_hdr->daddr.s6_addr32[2], ip6_hdr->daddr.s6_addr32[3]);
@@ -540,13 +550,13 @@ static int ip6_ip4(char *src, int len, char *dst, int include_flag, unsigned cha
 			}
 		}
 		else { /* It's normal IP packet (not included in ICMP) */
-			if (ip6_hdr->saddr.s6_addr32[2] != htonl(TRANSLATED_PREFIX)) {
+			if (ip6_hdr->saddr.s6_addr32[2] != htonl(TRANSLATED_PREFIX_C) || ip6_hdr->saddr.s6_addr32[1] != htonl(TRANSLATED_PREFIX_B) || ip6_hdr->saddr.s6_addr32[0] != htonl(TRANSLATED_PREFIX_A)) {
 				PDEBUG("ip6_ip4(): Src addr isn't translated addr: %x%x%x%x, packet dropped.\n",
 					   ip6_hdr->saddr.s6_addr32[0], ip6_hdr->saddr.s6_addr32[1],
 					   ip6_hdr->saddr.s6_addr32[2], ip6_hdr->saddr.s6_addr32[3]);
 				return -1;
 			}
-			if ( ip6_hdr->daddr.s6_addr32[2] != htonl(MAPPED_PREFIX)) {
+			if ( ip6_hdr->daddr.s6_addr32[0] != htonl(MAPPED_PREFIX_A) || ip6_hdr->daddr.s6_addr32[1] != htonl(MAPPED_PREFIX_B) ) {
 				PDEBUG("ip6_ip4(): Dst addr isn't mapped addr: %x%x%x%x, packet dropped.\n",
 					   ip6_hdr->daddr.s6_addr32[0], ip6_hdr->daddr.s6_addr32[1],
 					   ip6_hdr->daddr.s6_addr32[2], ip6_hdr->daddr.s6_addr32[3]);
@@ -1167,7 +1177,7 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 	int len;                    /* original packets length */
 	int new_packet_len;
 	int skb_delta = 0;          /* delta size for allocate new skb */
-	unsigned char mac[6];
+	unsigned char mac[ETH_ALEN];
 	char new_packet_buff[2048];
 
 	/* Check pointer to sk_buff and device structs */
@@ -1340,8 +1350,8 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 		memcpy(skb_put(skb2, new_packet_len + dev->hard_header_len), (char *)eth_h, dev->hard_header_len);
 		eth_h = (struct ethhdr *)skb2->data;
 		eth_h->h_proto = htons(ETH_P_IP);
-		memcpy(eth_h->h_dest, &mac, 6);
-		memcpy(eth_h->h_source, dev->dev_addr, 6);
+		memcpy(eth_h->h_dest, &mac, ETH_ALEN);
+		memcpy(eth_h->h_source, dev->dev_addr, ETH_ALEN);
 		skb_reset_mac_header(skb2);
 		skb_pull(skb2, dev->hard_header_len);
 		memcpy(skb2->data, new_packet_buff, new_packet_len);
