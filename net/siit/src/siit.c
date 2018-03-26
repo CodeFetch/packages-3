@@ -1178,14 +1178,15 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	struct sk_buff *skb2 = NULL;/* pointer to new struct sk_buff for transleded packet */
 	struct ethhdr *eth_h;       /* pointer to incoming Ether header */
-	struct arphdr *arp_header; // points to arp header
-	struct iphdr *ip_hdr; // used for ARP points to (nonexistent) IP header - only used to calculate checksum
+	struct arphdr *parp; // points to arp header
 	char tmp[10];
 	int len;                    /* original packets length */
 	int new_packet_len;
 	int skb_delta = 0;          /* delta size for allocate new skb */
 	unsigned char mac[ETH_ALEN];
 	char new_packet_buff[2048];
+	u8 *arpptr, *sha;
+	__be32 sip, tip;
 
 	/* Check pointer to sk_buff and device structs */
 	if (skb == NULL || dev == NULL)
@@ -1228,25 +1229,26 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 	/* Remove hardware header from origin sk_buff */
 	skb_pull(skb,dev->hard_header_len);
 
+
+
 	/*
 	 * Process IPv4 packet
 	 */
-	if (unlikely(ntohs(skb->protocol) == ETH_P_ARP)) {
-
+	if (eth_h->h_proto == htons(ETH_P_ARP)) {
 		if (memcmp(dev->dev_addr, siit_dev4->dev_addr, ETH_ALEN) != 0)
 		{
-			PDEBUG("siit_xmit(): siit6 device does not accept ARP packets, packet dropped.\n");
-			siit_stats(dev)->rx_dropped++;
-			dev_kfree_skb(skb);
+			PDEBUG("siit_xmit(): siit6 device does not accept ARP packets, packet ignored.\n");
 			return 0;
 		}
-		arp_header = arp_hdr(skb);
-		if(arp_header->ar_op != ARPOP_REQUEST) {
-			// we are not interested
-			siit_stats(dev)->rx_dropped++;
-			dev_kfree_skb(skb);
+		if ((dev->flags & IFF_NOARP) || !pskb_may_pull(skb, arp_hdr_len(dev)))
 			return 0;
-		}
+
+		parp = arp_hdr(skb);
+		if (parp->ar_pro != htons(ETH_P_IP) || parp->ar_hln != dev->addr_len ||	parp->ar_pln != 4)
+			return 0;
+
+		if(parp->ar_op != ARPOP_REQUEST)
+			return 0;
 
 		skb2 = dev_alloc_skb(len+dev->hard_header_len+skb_delta);
 		if (!skb2) {
@@ -1256,37 +1258,29 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 
 			return 0;
 		}
-		/* allocate skb->data portion = IPv4 packet len + ether header len
-		 * and copy to head of skb->data ether header from origin skb
-		 */
-		memcpy(skb_put(skb2, len+dev->hard_header_len), (char *)eth_h, dev->hard_header_len);
-		/* set destination l2 address to source l2 address */
-		eth_h = (struct ethhdr *)skb2->data;
-		eth_h->h_proto = htons(ETH_P_ARP);
-		memcpy(eth_h->h_dest, eth_h->h_source, dev->addr_len);
-		memcpy(eth_h->h_source, siit_dev4->dev_addr, ETH_ALEN);
-		skb_reset_mac_header(skb2);
 
-		/* remove ether header from new skb->data,
-		 * NOTE! data will rest, pointer to data and data len will change
-		 */
-		skb_pull(skb2, dev->hard_header_len);
-		/* set skb protocol to ARP */
-		skb2->protocol = htons(ETH_P_ARP);
-		ip_hdr = (struct iphdr *)skb2->data;
-		arp_header = arp_hdr(skb2);
-		arp_header->ar_op = htons(ARPOP_REPLY);
-		// copy old source hw/proto addr to tmp
-		memcpy(tmp, (char *)arp_header + ARP_SHA_OFFSET, 10);
-		// copy old destination hw/proto addr to source
-		memcpy((char *)arp_header + ARP_SHA_OFFSET, (void*)arp_header + ARP_THA_OFFSET, 10);
-		// copy old source hw/proto addr to destination
-		memcpy((char *)arp_header + ARP_THA_OFFSET, tmp, 10);
-		ip_hdr->check = 0;
-		ip_hdr->check = ip_fast_csum((unsigned char *)ip_hdr, ip_hdr->ihl);
+		arpptr = (u8 *)parp + sizeof(struct arphdr);
+		sha = arpptr;
+		arpptr += dev->addr_len;	/* sha */
+		memcpy(&sip, arpptr, sizeof(sip));
+		arpptr += sizeof(sip);
+		arpptr += dev->addr_len;	/* tha */
+		memcpy(&tip, arpptr, sizeof(tip));
+
+		// not our ip
+		if(tip != htonl(GWIP))
+			return 0;
+
+		// arp_create(ARPOP_REPLY, ETH_P_ARP, dest_ip, dev, src_ip, dest_hw, src_hw, target_hw);
+		skb2 = arp_create(ARPOP_REPLY, ETH_P_ARP, sip, dev, htonl(GWIP), eth_h->h_source, dev->dev_addr, dev->dev_addr);
+		if (!skb2)
+			return 0;
+
+		skb_reset_mac_header(skb2);
+		skb_pull(skb2, skb_network_offset(skb2));
+
 		skb2->dev = dev;
-	}
-	if (ntohs(skb->protocol) == ETH_P_IP) {
+	} else if (ntohs(skb->protocol) == ETH_P_IP) {
 		int hdr_len;            /* IPv4 header length */
 		int data_len;           /* IPv4 data length */
 		struct iphdr *ih4;      /* pointer to IPv4 header */
@@ -1494,6 +1488,7 @@ static void siit_init(struct net_device *dev)
 	 * Assign device function.
 	 */
 	dev->netdev_ops = &siit_netdev_ops;
+	//dev->flags           |= IFF_NOARP;     /* ARP not used */
 	dev->tx_queue_len = 10;
 
 	if (!header_ops_init) {
