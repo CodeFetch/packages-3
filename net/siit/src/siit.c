@@ -8,13 +8,16 @@
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/kernel.h>       /* printk() */
-#include <linux/slab.h>
-
+#include <linux/slab.h>		// for memory allocation
+#include <linux/fs.h>           // for basic filesystem
+#include <linux/proc_fs.h>      // for the proc filesystem
+#include <linux/seq_file.h>     // for sequence files
 #include <linux/errno.h>        /* error codes */
 #include <linux/types.h>        /* size_t */
 #include <linux/interrupt.h>    /* mark_bh */
 #include <linux/random.h>
 #include <linux/in.h>
+#include <linux/hashtable.h>	/* hashtable siit_hash */
 #include <linux/netdevice.h>    /* struct device, and other headers */
 #include <linux/etherdevice.h>  /* eth_type_trans */
 #include <net/ip.h>             /* struct iphdr */
@@ -28,9 +31,12 @@
 #include <asm/checksum.h>
 #include <net/ip6_checksum.h>
 #include <linux/in6.h>
+#include <linux/if_arp.h>
+#include <net/arp.h>
 #include "siit.h"
 
-MODULE_AUTHOR("Dmitriy Moscalev, Grigory Klyuchnikov, Felix Fietkau");
+
+MODULE_AUTHOR("Dmitriy Moscalev, Grigory Klyuchnikov, Felix Fietkau, Andrew Yourtchenko, Vincent Wiemann");
 
 /*
  * If tos_ignore_flag != 0, we don't copy TOS and Traffic Class
@@ -38,10 +44,19 @@ MODULE_AUTHOR("Dmitriy Moscalev, Grigory Klyuchnikov, Felix Fietkau");
  */
 int tos_ignore_flag = 0;
 
+static struct net_device *siit_dev4 = NULL;
+static struct net_device *siit_dev6 = NULL;
+static struct proc_dir_entry *siit_proc_entry;
+static struct proc_dir_entry *siit_proc_parent;
+static kmem_cache_t *siit_cache;
+static siit_options_t *siit_options;
+
+DEFINE_HASHTABLE(siit_hash, 8);
+
 #define siit_stats(_dev) (&(_dev)->stats)
 
 /*
- * The Utility  stuff
+ * Utility functions
  */
 
 #ifdef SIIT_DEBUG
@@ -74,6 +89,357 @@ static int siit_print_dump(char *data, int len, char *message)
 }
 #endif
 
+
+// Parse a MAC address
+int parse_mac(char* arg, u_int8_t addr[])
+{
+  for (int i = 0; i < 6; i++)
+  {
+    long b = strtol(arg+(3*i), (char **) NULL, 16);
+    addr[i] = (char)b;
+  }
+  return 0;
+}
+
+/* 
+ * Parse an IPv6 address (if pref_len is NULL), or prefix (if it isn't).
+ * parses destructively (places \0 between address and prefix len)
+ */
+int parse_ipv6_prefix(struct in6_addr *pref, int *pref_len, char *arg) {
+  int err = 0;
+  char *arg_plen = strchr(arg, '/');
+  if (arg_plen) {
+    *arg_plen++ = 0;
+    if (pref_len) {
+      *pref_len = simple_strtol(arg_plen, NULL, 10);
+    }
+  }
+  err = (1 != in6_pton(arg, -1, (u8 *)pref, '\0', NULL));
+  return err;
+}
+
+int parse_ipv4_prefix(u32 *v4addr, int *pref_len, char *arg) {
+  int err = 0;
+  char *arg_plen = strchr(arg, '/');
+  if (arg_plen) {
+    *arg_plen++ = 0;
+    if (pref_len) {
+      *pref_len = simple_strtol(arg_plen, NULL, 10);
+    }
+  }
+  err = (1 != in4_pton(arg, -1, (u8 *)v4addr, '/', NULL));
+  return err;
+}
+
+siit_options_t *alloc_siit_options(int nrules, siit_options_t *old, int from_irule, int to_irule) {
+
+/* Allocate a quantum using the memory cache */
+if (!dptr->data[s_pos]) {
+    dptr->data[s_pos] = kmem_cache_alloc(scullc_cache, GFP_KERNEL);
+    if (!dptr->data[s_pos])
+        goto nomem;
+    memset(dptr->data[s_pos], 0, scullc_quantum);
+}
+
+
+  siit_options_t *opts = kzalloc(sizeof(siit_options_t) + nrules*sizeof(siit_rule_t), GFP_KERNEL);
+  if (!opts) {
+    printk("siit: could not alloc options with %d rules\n", nrules);
+    return NULL;
+  } else {
+    printk("siit: allocated options with %d rules\n", nrules);
+  }
+  opts->npairs = npairs;
+  opts->refcount = 1; /* The caller gets the reference */
+  if (old) {
+    opts->gw_ip = old->gw_ip;
+    opts->gw_mac = old->gw_mac;
+    opts->local_pref = old->local_pref;
+    opts->remote_pref = old->remote_pref;
+    for(; (from_ipair >= 0) && (to_ipair >= 0) &&
+          (from_ipair < old->nrules) && (to_ipair < opts->nrules); from_irule++, to_irule++) {
+      opts->rules[to_irule] = old->rules[from_irule];
+    }
+  }
+  return opts;
+}
+
+siit_rule_t* create_rule( ) = kzalloc(sizeof(siit_options_t) + nrules*sizeof(siit_rule_t), GFP_KERNEL);
+  if (!opts) {
+    printk("siit: could not alloc options with %d rules\n", nrules);
+    return NULL;
+  } else {
+    printk("siit: allocated options with %d rules\n", nrules);
+  }
+  opts->npairs = npairs;
+  opts->refcount = 1; /* The caller gets the reference */
+  if (old) {
+    opts->gw_ip = old->gw_ip;
+    opts->gw_mac = old->gw_mac;
+    opts->local_pref = old->local_pref;
+    opts->remote_pref = old->remote_pref;
+    for(; (from_ipair >= 0) && (to_ipair >= 0) &&
+          (from_ipair < old->nrules) && (to_ipair < opts->nrules); from_irule++, to_irule++) {
+      opts->rules[to_irule] = old->rules[from_irule];
+    }
+  }
+  return opts;
+}
+
+siit_rule_t *siit_rule_get(unsigned char *mac) {
+	siit_rule_t *rule;
+	hash_for_each_possible_rcu_notrace(siit_cache, rule, hash_list, mac)
+		if (memcmp(rule->mac, mac, ETH_ALEN) == 0) 
+			return rule;
+	return NULL;
+}
+
+void siit_rule_del(unsigned char *mac) {
+	siit_rule_t *rule = siit_rule_get(mac);
+
+	if (rule) {
+		hlist_del(rule->hash_list);
+		kmem_cache_free(siit_cache, rule);
+		return 0;
+	}
+
+	return -1;
+}
+
+siit_rule_t *siit_rule_add(unsigned char *mac, u32 *ip4, siit_plat_t *plat, struct in6_addr *ip6, int state) {
+	siit_rule_t *rule = siit_get_rule(mac);
+
+	if(!rule) {
+		rule = kmem_cache_alloc(siit_cache, GFP_ATOMIC); // todo: flag in options
+		if(!rule) 
+			goto error_alloc;
+		hash_add_rcu(siit_hash, rule, mac);
+	}
+
+	rule->prev = siit_opts->firstrule;
+	rule->next = siit_opts->firstrule->next
+	siit_opts->firstrule->next = rule;
+
+	rule->state = state;
+
+	if(!plat)
+		rule->plat = plat;
+	  else
+		rule->plat = siit_opts->firstplat;
+
+	if(ip4) {
+		memcpy(&rule.ip4, ip4, 4);
+	} else if(rule.ip4 == 0)
+		memcpy(&rule.ip4, &rule->plat.default_client_ip4, 4);
+
+	memcpy(&rule.mac, mac, 6);
+
+	if(!ip6) {
+	// todo: calculate using defaults
+	} else
+		memcpy(&rule.ip6, ip6, sizeof(struct in6_addr))
+
+	return rule;
+}
+
+// proc functions
+
+/* return the current arg, and advance the tail to the next space-separated word */
+char *get_next_arg(char **ptail) {
+  char *pc = NULL;
+  while ((*ptail) && (**ptail) && ((**ptail == ' ') || (**ptail == '\n'))) {
+    **ptail = 0;
+    (*ptail)++;
+  }
+  pc = *ptail;
+
+  while ((*ptail) && (**ptail) && ((**ptail != ' ') && (**ptail != '\n'))) {
+    (*ptail)++;
+  }
+
+  while ((*ptail) && (**ptail) && ((**ptail == ' ') || (**ptail == '\n'))) {
+    **ptail = 0;
+    (*ptail)++;
+  }
+
+  if ((pc) && (0 == *pc)) {
+    pc = NULL;
+  }
+  return pc;
+}
+
+static ssize_t siit_proc_write(struct file *file, const char __user *buffer, size_t count, loff_t *ppos)
+{
+	char *buf = NULL;
+	char *tail = NULL;
+	char *arg_name = NULL;
+
+	buf = kmalloc(sizeof(char) * (count + 1), GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	if (copy_from_user(buf, buffer, count)) {
+		kfree(buf);
+		return -EFAULT;
+	}
+	tail = buf;
+	buf[count] = '\0';
+	if( (count > 0) && (buf[count-1] == '\n') ) {
+		buf[count-1] = '\0';
+	}
+
+	while (NULL != (arg_name = get_next_arg(&tail))) {
+		if (0 == strcmp(arg_name, "config")) {
+			printk(KERN_INFO "siit: configure devices with '%s'\n", tail);
+			siit_config_set(tail, strlen(tail));
+		} else if (0 == strcmp(arg_name, "rule_add")) {
+			printk(KERN_INFO "siit: add rule with '%s'\n", tail);
+			siit_rule_add(tail, strlen(tail));
+		} else if (0 == strcmp(arg_name, "rule_del")) {
+			printk(KERN_INFO "siit: delete rule with '%s'\n", tail);
+			siit_rule_del(tail, strlen(tail));
+		}
+	}
+
+	kfree(buf);
+	return count;
+}
+
+
+int siit_get_irule_config(int irule, char *buf, int count) {
+  int ret = 0;
+  char *format = "local.v4 %pI4/%d local.v6 %pI6c/%d local.style %s local.ea-len %d local.psid-offset %d remote.v4 %pI4/%d remote.v6 %pI6c/%d remote.style %s remote.ea-len %d remote.psid-offset %d debug %d";
+
+  if ((ipair < 0) || (ipair >= siit->nrules)) {
+    return ret;
+  }
+  apair = &siit_opts->pairs[ipair];
+
+  ret = snprintf(buf, count, format,
+		&arule->local.v4_pref, arule->local.v4_pref_len,
+		&arule->local.v6_pref, arule->local.v6_pref_len,
+		xlate_style_to_string(arule->local.style),
+		arule->local.ea_len, arule->local.psid_offset,
+
+		&arule->remote.v4_pref, arule->remote.v4_pref_len,
+		&arule->remote.v6_pref, arule->remote.v6_pref_len,
+		xlate_style_to_string(arule->remote.style),
+		arule->remote.ea_len, arule->remote.psid_offset);
+  return ret;
+}
+
+int siit_get_config(char *buf, int count) {
+  int ret = 0;
+  if (siit_opts->npairs > 0) {
+    ret = siit_get_ipair_config(siit_opts, siit_opts->npairs-1, buf, count);
+  } else {
+    nat46debug(0, "siit_get_config: nrules is 0");
+  }
+  return ret;
+}
+
+
+void siit_config_dump(struct seq_file *m) {
+
+	nat46_instance_t *nat46 = netdev_nat46_instance(dev);
+	int buflen = 1024;
+	int ipair = -1;
+	char *buf = kmalloc(buflen+1, GFP_KERNEL);
+	seq_printf(m, "add %s\n", dev->name);
+	if(buf) {
+		for(ipair = 0; ipair < nat46->npairs; ipair++) {
+			nat46_get_ipair_config(nat46, ipair, buf, buflen);
+			if(ipair < nat46->npairs-1)
+				seq_printf(m,"insert %s %s\n", dev->name, buf);
+			else
+				seq_printf(m,"config %s %s\n", dev->name, buf);
+		}
+	}
+	seq_printf(m,"\n");
+	kfree(buf);
+}
+
+static int siit_proc_show(struct seq_file *m, void *v)
+{
+	siit_config_dump(m);
+	return 0;
+}
+
+
+static int siit_proc_open(struct inode *inode, struct file *file)
+{
+	return single_open(file, siit_proc_show, NULL);
+}
+
+static const struct file_operations siit_proc_fops = {
+	.owner		= THIS_MODULE,
+	.open		= siit_proc_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= single_release,
+	.write		= siit_proc_write,
+};
+
+int create_siit_proc_entry(void) {
+	siit_proc_parent = proc_mkdir(SIIT_PROC_NAME, init_net.proc_net);
+	if (siit_proc_parent) {
+		siit_proc_entry = proc_create(SIIT_CONTROL_PROC_NAME, 0644, siit_proc_parent, &siit_proc_fops );
+		if(!siit_proc_entry) {
+			printk(KERN_INFO "siit: error creating proc entry");
+			return -ENOMEM;
+		}
+	}
+	return 0;
+}
+
+int siit_set_config(char *buf, int count) {
+  int ret = -1;
+  if (siit_opts->nrules > 0) {
+    ret = siit_set_irule_config(siit_opts, siit_opts->nrules-1, buf, count);
+  }
+  return ret;
+}
+
+int siit_set_irule_config(int irule, char *buf, int count) {
+  char *tail = buf;
+  char *arg_name;
+  int err = 0;
+  char *val;
+  siit_rule_t *arule = NULL;
+
+  if ((irule < 0) || (irule >= siit_opts->nrules)) {
+    return -1;
+  }
+
+  arule = &siit_opts->rules[irule];
+
+  while ((0 == err) && (NULL != (arg_name = get_next_arg(&tail)))) {
+    if (0 == strcmp(arg_name, "gwmac")) {
+      err = parse_mac(get_next_arg(&tail), siit_opts->gw_mac);
+    } else if (0 == strcmp(arg_name, "gwip")) {
+      err = parse_ipv4_prefix(get_next_arg(&tail), siit_opts->gw_ip, siit_opts->gw_ip_len); !!!!!!!!!!!!!!!!!!!!
+    }
+  }
+  return err;
+}
+
+
+int siit_insert_rule(char *buf) {
+	int ret = -1;
+	siit_options_t *opts_new = alloc_siit_options(siit_opts->npairs+1, siit_opts, 0, 1);
+	if(opts) {
+		kfree(siit_opts); FREE MEMORY
+		siit_opts = opts;
+		ret = siit_set_irule_config(opts, 0, buf, strlen(buf));
+	} else {
+		printk("Could not insert a new rule\n");
+	}
+
+	return ret;
+}
+
+
+
 /*
  * Open and close
  */
@@ -103,7 +469,7 @@ static int siit_release(struct net_device *dev)
  *                included IP packet, else = 0
  */
 
-static int ip4_ip6(char *src, int len, char *dst, int include_flag)
+static int ip4_ip6(char *src, int len, char *dst, int include_flag, unsigned char *mac)
 {
 	struct iphdr *ih4 = (struct iphdr *) src; /* point to current IPv4 header struct */
 	struct icmphdr *icmp_hdr;   /* point to current ICMPv4 header struct */
@@ -208,7 +574,7 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag)
 
 	if (include_flag) {
 		/*
-		   It's ICMP included IP packet and there is a diffirence
+		   It's ICMP included IP packet and there is a difference
 		   in src/dst addresses then src/dst in normal direction
 		 */
 
@@ -217,9 +583,9 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag)
 		   is IPv4-translated IPv6 address because packet traveled
 		   from IPv6 to IPv4 area
 		*/
-		ih6->saddr.in6_u.u6_addr32[0] = 0;
-		ih6->saddr.in6_u.u6_addr32[1] = 0;
-		ih6->saddr.in6_u.u6_addr32[2] = htonl(TRANSLATED_PREFIX); /* to network order bytes */
+		ih6->saddr.in6_u.u6_addr32[0] = htonl(TRANSLATED_PREFIX_A);
+		ih6->saddr.in6_u.u6_addr32[1] = htonl(TRANSLATED_PREFIX_B);
+		ih6->saddr.in6_u.u6_addr32[2] = htonl(TRANSLATED_PREFIX_C); /* to network order bytes */
 		ih6->saddr.in6_u.u6_addr32[3] = ih4->saddr;
 
 		/*
@@ -227,13 +593,24 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag)
 		   is IPv4-mapped address (but it's not IPv4- mapped, we use
 		   prefix ::ffff:ffff:0:0/96
 		 */
-		ih6->daddr.in6_u.u6_addr32[0] = 0;
-		ih6->daddr.in6_u.u6_addr32[1] = 0;
-		ih6->daddr.in6_u.u6_addr32[2] = htonl(MAPPED_PREFIX); /* to network order bytes */
-		ih6->daddr.in6_u.u6_addr32[3] = ih4->daddr;
+		ih6->daddr.in6_u.u6_addr32[0] = htonl(MAPPED_PREFIX_A);
+		ih6->daddr.in6_u.u6_addr32[1] = htonl(MAPPED_PREFIX_B);
+		ih6->daddr.in6_u.u6_addr16[4] = htons(((mac[0] ^ 0x02) << 8) | mac[1]);
+		ih6->daddr.in6_u.u6_addr16[5] = htons((mac[2] << 8) | 0xff);
+		ih6->daddr.in6_u.u6_addr16[6] = htons(0xfe00 | mac[3]);
+		ih6->daddr.in6_u.u6_addr16[7] = htons((mac[4] << 8) | mac[5]);
+
 	}
 	else {
-
+		if((ih4->saddr & htonl(IPRANGE)) != htonl(IPRANGE)) { 
+			PDEBUG("ip4_ip6(): Src address not in local IPv4 range: %pI4, packet dropped.\n",
+					&ih4->saddr);
+			return -1;
+		} else if((ih4->daddr & htonl(IPRANGE)) == htonl(IPRANGE)) {
+			PDEBUG("ip4_ip6(): Dst address in local IPv4 range: %pI4, packet dropped.\n",
+					&ih4->daddr);
+			return -1;
+		}
 		/*
 		   This is normal case (packet isn't included IP packet)
 
@@ -241,17 +618,20 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag)
 		   is IPv4-mapped address (but it's not IPv4- mapped, we use
 		   prefix ::ffff:ffff:0:0/96)
 		*/
-		ih6->saddr.in6_u.u6_addr32[0] = 0;
-		ih6->saddr.in6_u.u6_addr32[1] = 0;
-		ih6->saddr.in6_u.u6_addr32[2] = htonl(MAPPED_PREFIX); /* to network order bytes */
-		ih6->saddr.in6_u.u6_addr32[3] = ih4->saddr;
+		ih6->saddr.in6_u.u6_addr32[0] = htonl(MAPPED_PREFIX_A);
+		ih6->saddr.in6_u.u6_addr32[1] = htonl(MAPPED_PREFIX_B);
+		ih6->saddr.in6_u.u6_addr16[4] = htons(((mac[0] ^ 0x02) << 8) | mac[1]);
+		ih6->saddr.in6_u.u6_addr16[5] = htons((mac[2] << 8) | 0xff);
+		ih6->saddr.in6_u.u6_addr16[6] = htons(0xfe00 | mac[3]);
+		ih6->saddr.in6_u.u6_addr16[7] = htons((mac[4] << 8) | mac[5]);
+
 
 		/* Destination address
-		   is is IPv4-translated IPv6 address
+		   is IPv4-translated IPv6 address
 		 */
-		ih6->daddr.in6_u.u6_addr32[0] = 0;
-		ih6->daddr.in6_u.u6_addr32[1] = 0;
-		ih6->daddr.in6_u.u6_addr32[2] = htonl(TRANSLATED_PREFIX); /* to network order bytes */
+		ih6->daddr.in6_u.u6_addr32[0] = htonl(TRANSLATED_PREFIX_A);
+		ih6->daddr.in6_u.u6_addr32[1] = htonl(TRANSLATED_PREFIX_B);
+		ih6->daddr.in6_u.u6_addr32[2] = htonl(TRANSLATED_PREFIX_C); /* to network order bytes */
 		ih6->daddr.in6_u.u6_addr32[3] = ih4->daddr;
 	}
 
@@ -274,8 +654,7 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag)
 		icmp_hdr = (struct icmphdr *) (src+hdr_len); /* point to ICMPv4 header */
 		csum = 0;
 		icmp_len =  ntohs(ih4->tot_len) - hdr_len; /* ICMPv4 packet length */
-		icmp6_hdr = (struct icmp6hdr *)(dst+sizeof(struct ipv6hdr)
-									    +fr_flag*sizeof(struct frag_hdr)); /* point to ICMPv6 header */
+		icmp6_hdr = (struct icmp6hdr *)(dst + sizeof(struct ipv6hdr) + fr_flag*sizeof(struct frag_hdr)); /* point to ICMPv6 header */
 
 		if (include_flag) {
 			/* ICMPv4 packet cannot be included in ICMPv4 Error message */
@@ -403,15 +782,15 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag)
 			/* Call our ip4_ip6() to translate included IP packet */
 			if (ip4_ip6(src+hdr_len+sizeof(struct icmphdr), len - hdr_len - sizeof(struct icmphdr),
 						dst+sizeof(struct ipv6hdr)+fr_flag*sizeof(struct frag_hdr)
-						+sizeof(struct icmp6hdr), 1) == -1) {
+						+sizeof(struct icmp6hdr), 1, mac) == -1) {
 				PDEBUG("ip4_ip6(): Uncorrect translation of ICMPv4 Error message - packet dropped.\n");
 				return -1;
 			}
-			/* correct ICMPv6 packet length for diffirence between IPv4 and IPv6 headers
+			/* correct ICMPv6 packet length for difference between IPv4 and IPv6 headers
 			   in included IP packet
 			   */
 			icmp_len += 20;
-			/* and correct Payload length for diffirence between IPv4 and IPv6 headers */
+			/* and correct Payload length for difference between IPv4 and IPv6 headers */
 			plen += 20;
 			ih6->payload_len = htons(plen);
 		}
@@ -422,8 +801,7 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag)
 		csum = 0;
 
 		csum = csum_partial((u_char *)icmp6_hdr, icmp_len, csum);
-		icmp6_hdr->icmp6_cksum = csum_ipv6_magic(&ih6->saddr, &ih6->daddr, icmp_len,
-									         IPPROTO_ICMPV6, csum);
+		icmp6_hdr->icmp6_cksum = csum_ipv6_magic(&ih6->saddr, &ih6->daddr, icmp_len, IPPROTO_ICMPV6, csum);
 		break;
 
 	/* Process TCP protocols data */
@@ -441,7 +819,7 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag)
 				/* It's a first fragment */
 				if (udp_hdr->check == 0) {
 					/* System management event */
-					printk("siit: First fragment of UDP with zero checksum - packet droped\n");
+					printk("siit: First fragment of UDP with zero checksum - packet dropped\n");
 					printk("siit: addr: %x src port: %d dst port: %d\n",
 						   htonl(ih4->saddr), htons(udp_hdr->source), htons(udp_hdr->dest));
 					return -1;
@@ -495,7 +873,7 @@ static int ip4_ip6(char *src, int len, char *dst, int include_flag)
  *
  */
 
-static int ip6_ip4(char *src, int len, char *dst, int include_flag)
+static int ip6_ip4(char *src, int len, char *dst, int include_flag, unsigned char *mac)
 {
 	struct ipv6hdr *ip6_hdr;    /* point to current IPv6 header struct */
 	struct iphdr *ip_hdr;       /* point to current IPv4 header struct */
@@ -520,15 +898,14 @@ static int ip6_ip4(char *src, int len, char *dst, int include_flag)
 		real_len = sizeof(struct iphdr);
 
 		/* Check validation of Saddr & Daddr? is a packet to fall under our translation? */
-		if (include_flag) { /* It's ICMP included IP packet,
-							   about process include_flag see comment in ip4_ip6() */
-			if (ip6_hdr->saddr.s6_addr32[2] != htonl(MAPPED_PREFIX)) {
+		if (include_flag) { /* It's ICMP included IP packet, about process include_flag see comment in ip4_ip6() */
+			if (ip6_hdr->saddr.s6_addr32[0] != htonl(MAPPED_PREFIX_A) || ip6_hdr->saddr.s6_addr32[1] != htonl(MAPPED_PREFIX_B)) {
 				PDEBUG("ip6_ip4(): Included IP packet Src addr isn't mapped addr: %x%x%x%x, packet dropped.\n",
 					   ip6_hdr->saddr.s6_addr32[0], ip6_hdr->saddr.s6_addr32[1],
 					   ip6_hdr->saddr.s6_addr32[2], ip6_hdr->saddr.s6_addr32[3]);
 				return -1;
 			}
-			if ( ip6_hdr->daddr.s6_addr32[2] != htonl(TRANSLATED_PREFIX)) {
+			if ( ip6_hdr->daddr.s6_addr32[2] != htonl(TRANSLATED_PREFIX_C) || ip6_hdr->daddr.s6_addr32[1] != htonl(TRANSLATED_PREFIX_B) || ip6_hdr->daddr.s6_addr32[0] != htonl(TRANSLATED_PREFIX_A)) {
 				PDEBUG("ip6_ip4(): Included IP packet Dst addr isn't translated addr: %x%x%x%x, packet dropped.\n",
 					   ip6_hdr->daddr.s6_addr32[0], ip6_hdr->daddr.s6_addr32[1],
 					   ip6_hdr->daddr.s6_addr32[2], ip6_hdr->daddr.s6_addr32[3]);
@@ -536,13 +913,13 @@ static int ip6_ip4(char *src, int len, char *dst, int include_flag)
 			}
 		}
 		else { /* It's normal IP packet (not included in ICMP) */
-			if (ip6_hdr->saddr.s6_addr32[2] != htonl(TRANSLATED_PREFIX)) {
+			if (ip6_hdr->saddr.s6_addr32[2] != htonl(TRANSLATED_PREFIX_C) || ip6_hdr->saddr.s6_addr32[1] != htonl(TRANSLATED_PREFIX_B) || ip6_hdr->saddr.s6_addr32[0] != htonl(TRANSLATED_PREFIX_A)) {
 				PDEBUG("ip6_ip4(): Src addr isn't translated addr: %x%x%x%x, packet dropped.\n",
 					   ip6_hdr->saddr.s6_addr32[0], ip6_hdr->saddr.s6_addr32[1],
 					   ip6_hdr->saddr.s6_addr32[2], ip6_hdr->saddr.s6_addr32[3]);
 				return -1;
 			}
-			if ( ip6_hdr->daddr.s6_addr32[2] != htonl(MAPPED_PREFIX)) {
+			if ( ip6_hdr->daddr.s6_addr32[0] != htonl(MAPPED_PREFIX_A) || ip6_hdr->daddr.s6_addr32[1] != htonl(MAPPED_PREFIX_B) ) {
 				PDEBUG("ip6_ip4(): Dst addr isn't mapped addr: %x%x%x%x, packet dropped.\n",
 					   ip6_hdr->daddr.s6_addr32[0], ip6_hdr->daddr.s6_addr32[1],
 					   ip6_hdr->daddr.s6_addr32[2], ip6_hdr->daddr.s6_addr32[3]);
@@ -756,8 +1133,15 @@ static int ip6_ip4(char *src, int len, char *dst, int include_flag)
 
 	/* IPv4 Src addr = last 4 bytes from IPv6 Src addr */
 	ip_hdr->saddr = ip6_hdr->saddr.s6_addr32[3];
-	/* IPv4 Dst addr = last 4 bytes from IPv6 Dst addr */
-	ip_hdr->daddr = ip6_hdr->daddr.s6_addr32[3];
+	/* IPv4 Dst addr = fixed value at the moment */
+	ip_hdr->daddr = htonl(IPADDR);
+	/* Retrieve MAC address from IPv6 Dest Addr */
+	mac[0] = (* ((unsigned char *)&ip6_hdr->daddr.s6_addr16[4])) ^ 0x02;
+	mac[1] = * ((unsigned char *)&ip6_hdr->daddr.s6_addr16[4]+1);
+	mac[2] = * ((unsigned char *)&ip6_hdr->daddr.s6_addr16[5]);
+	mac[3] = * ((unsigned char *)&ip6_hdr->daddr.s6_addr16[6]+1);
+	mac[4] = * ((unsigned char *)&ip6_hdr->daddr.s6_addr16[7]);
+	mac[5] = * ((unsigned char *)&ip6_hdr->daddr.s6_addr16[7]+1);
 
 	/* Calculate IPv4 header checksum */
 	ip_hdr->check = 0;
@@ -921,13 +1305,13 @@ static int ip6_ip4(char *src, int len, char *dst, int include_flag)
 					if (len_delta >= sizeof(struct ipv6hdr))
 					{
 						if((inc_opts_len = ip6_ip4((char *)icmp6_hdr + sizeof(struct icmp6hdr), len_delta,
-										           (char *)icmp_hdr + sizeof(struct icmphdr), 1)) == -1) {
+						    (char *)icmp_hdr + sizeof(struct icmphdr), 1, mac)) == -1) {
 							PDEBUG("ip6_ip4(): incorrect translation of ICMPv6 Error message, packet dropped\n");
 							return -1;
 						}
 						/* correct IPv4 Total Len that = old Total Len
 						   - Options Headers Len in included IP packet
-						   - diffirence between IPv6 Header Len and IPv4 Header Len
+						   - difference between IPv6 Header Len and IPv4 Header Len
 						   */
 						if (ntot_len != 0)
 							ip_hdr->tot_len = htons(ntot_len - inc_opts_len - IP4_IP6_HDR_DIFF);
@@ -1092,7 +1476,7 @@ static int ip4_fragment(struct sk_buff *skb, int len, int hdr_len, struct net_de
 		skb2->protocol = htons(ETH_P_IPV6);
 
 		/* call translation function */
-		if ( ip4_ip6(buff, frag_len+hdr_len, skb2->data, 0) == -1) {
+		if ( ip4_ip6(buff, frag_len+hdr_len, skb2->data, 0, eth_h->h_source) == -1) {
 			dev_kfree_skb(skb2);
 			return -1;
 		}
@@ -1126,9 +1510,9 @@ static int ip4_fragment(struct sk_buff *skb, int len, int hdr_len, struct net_de
 	return 0;
 }
 /*
- * Transmit a packet (called by the kernel)
+ * Transmit a packet received on siit4 (called by the kernel)
  *
- * siit_xmit(skb, dev)
+ * siit_xmit4(skb, dev)
  *
  * where
  * skb - pointer to struct sk_buff with incomed packet
@@ -1149,14 +1533,16 @@ static int ip4_fragment(struct sk_buff *skb, int len, int hdr_len, struct net_de
  *            stats.tx_bytes+=skb2->len !!! But we don't set skb2->len !!!
  */
 
-static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
+static int siit_xmit4(struct sk_buff *skb, struct net_device *dev)
 {
 	struct sk_buff *skb2 = NULL;/* pointer to new struct sk_buff for transleded packet */
 	struct ethhdr *eth_h;       /* pointer to incoming Ether header */
+	struct arphdr *parp; // points to arp header
+	const char gwmac[] = GWMAC;
 	int len;                    /* original packets length */
-	int new_packet_len;
 	int skb_delta = 0;          /* delta size for allocate new skb */
-	char new_packet_buff[2048];
+	u8 *arpptr, *sha;
+	__be32 sip, tip;
 
 	/* Check pointer to sk_buff and device structs */
 	if (skb == NULL || dev == NULL)
@@ -1165,12 +1551,6 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 	/* Add receive statistic */
 	siit_stats(dev)->rx_bytes += skb->len;
 	siit_stats(dev)->rx_packets++;
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,7,0)
-	netif_trans_update(dev);
-#else
-	dev->trans_start = jiffies;
-#endif
 
 	/* Upper layer (IP) protocol forms sk_buff for outgoing packet
 	 * and sets IP header + Ether header too. IP layer sets outgoing
@@ -1196,13 +1576,63 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 	siit_print_dump(skb->data, ETH_HLEN, "siit: eth_hdr dump");
 #endif
 
+	if(!(siit_dev6->flags & IFF_UP))
+		return 0;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,7,0)
+	netif_trans_update(siit_dev6);
+#else
+	dev->trans_start = jiffies;
+#endif
+
 	/* Remove hardware header from origin sk_buff */
-	skb_pull(skb,dev->hard_header_len);
+	skb_pull(skb, dev->hard_header_len);
 
 	/*
-	 * Process IPv4 paket
+	 * Process IPv4 packet
 	 */
-	if (ntohs(skb->protocol) == ETH_P_IP) {
+	if (ntohs(skb->protocol) == htons(ETH_P_ARP)) {
+		if ((siit_dev4->flags & IFF_NOARP) || !pskb_may_pull(skb, arp_hdr_len(dev)))
+			return 0;
+
+		parp = arp_hdr(skb);
+		if (parp->ar_pro != htons(ETH_P_IP) || parp->ar_hln != siit_dev4->addr_len || parp->ar_pln != 4)
+			return 0;
+
+		if(parp->ar_op != ARPOP_REQUEST)
+			return 0;
+
+		// Read ARP header src addr sip and dest addr tip
+		arpptr = (u8 *)parp + sizeof(struct arphdr);
+		sha = arpptr;
+		arpptr += dev->addr_len;	/* sha */
+		memcpy(&sip, arpptr, sizeof(sip));
+		arpptr += sizeof(sip);
+		arpptr += dev->addr_len;	/* tha */
+		memcpy(&tip, arpptr, sizeof(tip));
+
+		if(tip == htonl(OWNIP)) {
+			skb2 = arp_create(ARPOP_REPLY, ETH_P_ARP, sip, siit_dev4, htonl(OWNIP), eth_h->h_source, siit_dev4->dev_addr, siit_dev4->dev_addr);
+		} else if (tip == htonl(GWIP)) {
+			skb2 = arp_create(ARPOP_REPLY, ETH_P_ARP, sip, siit_dev4, htonl(GWIP), eth_h->h_source, gwmac, gwmac);
+		} else {
+			return 0;
+		}
+
+		if(memcmp(eth_h->h_source, siit_dev4->dev_addr, ETH_ALEN) == 0) {
+			skb2->pkt_type = PACKET_HOST;
+		} else {
+			skb2->pkt_type = PACKET_OTHERHOST;
+		}
+
+		// arp_create(ARPOP_REPLY, ETH_P_ARP, dest_ip, dev, src_ip, dest_hw, src_hw, target_hw);
+
+		if (!skb2)
+			return 0;
+
+		skb_reset_mac_header(skb2);
+		skb_pull(skb2, skb_network_offset(skb2));
+	} else if (ntohs(skb->protocol) == ETH_P_IP) {
 		int hdr_len;            /* IPv4 header length */
 		int data_len;           /* IPv4 data length */
 		struct iphdr *ih4;      /* pointer to IPv4 header */
@@ -1210,9 +1640,15 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 
 		ih4 = (struct iphdr *)skb->data; /* point to incoming packet's IPv4 header */
 
+		if(memcmp(eth_h->h_dest, &gwmac, ETH_ALEN) != 0)
+		{
+			PDEBUG("siit_xmit4(): unknown destination MAC.\n");
+			return 0;
+		}
+
 		/* Check IPv4 Total Length */
 		if (skb->len != ntohs(ih4->tot_len)) {
-			PDEBUG("siit_xmit(): Different skb_len %x and ip4 tot_len %x - packet dropped.\n",
+			PDEBUG("siit_xmit4(): Different skb_len %x and ip4 tot_len %x - packet dropped.\n",
 				   skb->len, ih4->tot_len);
 			siit_stats(dev)->tx_errors++;
 			dev_kfree_skb(skb);
@@ -1265,33 +1701,31 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 		}
 
 		/* Allocate new sk_buff to compose translated packet */
-		skb2 = dev_alloc_skb(len+dev->hard_header_len+skb_delta);
+		skb2 = netdev_alloc_skb(siit_dev6, len+skb_delta);
 		if (!skb2) {
-			printk(KERN_DEBUG "%s: alloc_skb failure - packet dropped.\n", dev->name);
+			printk(KERN_DEBUG "%s: alloc_skb failure - packet dropped.\n", siit_dev6->name);
 			dev_kfree_skb(skb);
 			siit_stats(dev)->rx_dropped++;
 
 			return 0;
 		}
-		/* allocate skb->data portion = IPv4 packet len + ether header len
-		 * + skb_delta (max = two times (diffirence between IPv4 header and
+
+		memset(&(IPCB(skb2)->opt), 0, sizeof(IPCB(skb2)->opt));
+		/* allocate skb->data portion = IPv4 packet len
+		 * + skb_delta (max = two times (difference between IPv4 header and
 		 * IPv6 header + Frag Header), second for included packet,
-		 * and copy to head of skb->data ether header from origin skb
 		 */
-		memcpy(skb_put(skb2, len+dev->hard_header_len+skb_delta), (char *)eth_h, dev->hard_header_len);
-		/* correct ether header data, ether protocol field to ETH_P_IPV6 */
-		eth_h = (struct ethhdr *)skb2->data;
-		eth_h->h_proto = htons(ETH_P_IPV6);
+		skb_put(skb2, len+skb_delta);
 		skb_reset_mac_header(skb2);
-		/* remove ether header from new skb->data,
-		 * NOTE! data will rest, pointer to data and data len will change
-		 */
-		skb_pull(skb2,dev->hard_header_len);
+		skb_reset_network_header(skb2);
+		// 40 bytes / 48 bytes with frag
+		skb_set_transport_header(skb2, skb_delta + IP4_IP6_HDR_DIFF); 
 		/* set skb protocol to IPV6 */
 		skb2->protocol = htons(ETH_P_IPV6);
+		skb2->ip_summed = CHECKSUM_UNNECESSARY;
 
 		/* call translation function */
-		if (ip4_ip6(skb->data, len, skb2->data, 0) == -1 ) {
+		if (ip4_ip6(skb->data, len, skb2->data, 0, eth_h->h_source) == -1 ) {
 			dev_kfree_skb(skb);
 			dev_kfree_skb(skb2);
 			siit_stats(dev)->rx_errors++;
@@ -1299,55 +1733,19 @@ static int siit_xmit(struct sk_buff *skb, struct net_device *dev)
 			return 0;
 		}
 	}
-	/*
-	 * IPv6 paket
-	 */
-	else if (ntohs(skb->protocol) == ETH_P_IPV6) {
-
-#ifdef SIIT_DEBUG
-		siit_print_dump(skb->data, sizeof(struct ipv6hdr), "siit: (in) ip6_hdr dump");
-#endif
-		/* packet len = skb->data len*/
-		len = skb->len;
-
-		/* call translation function */
-		if ((new_packet_len = ip6_ip4(skb->data, len, new_packet_buff, 0)) == -1 )
-		{
-			PDEBUG("siit_xmit(): error translation ipv6->ipv4, packet dropped.\n");
-			siit_stats(dev)->rx_dropped++;
-			goto end;
-		}
-
-		/* Allocate new sk_buff to compose translated packet */
-		skb2 = dev_alloc_skb(new_packet_len + dev->hard_header_len);
-		if (!skb2) {
-			printk(KERN_DEBUG "%s: alloc_skb failure, packet dropped.\n", dev->name);
-			siit_stats(dev)->rx_dropped++;
-			goto end;
-		}
-		memcpy(skb_put(skb2, new_packet_len + dev->hard_header_len), (char *)eth_h, dev->hard_header_len);
-		eth_h = (struct ethhdr *)skb2->data;
-		eth_h->h_proto = htons(ETH_P_IP);
-		skb_reset_mac_header(skb2);
-		skb_pull(skb2, dev->hard_header_len);
-		memcpy(skb2->data, new_packet_buff, new_packet_len);
-		skb2->protocol = htons(ETH_P_IP);
-	}
 	else {
-		PDEBUG("siit_xmit(): unsupported protocol family %x, packet dropped.\n", skb->protocol);
+		PDEBUG("siit_xmit4(): unsupported protocol family %x, packet dropped.\n", skb->protocol);
 		goto end;
 	}
 
 	/*
 	 * Set needed fields in new sk_buff
 	 */
-	skb2->pkt_type = PACKET_HOST;
-	skb2->dev = dev;
-	skb2->ip_summed = CHECKSUM_UNNECESSARY;
+
 
 	/* Add transmit statistic */
-	siit_stats(dev)->tx_packets++;
-	siit_stats(dev)->tx_bytes += skb2->len;
+	siit_stats(skb2->dev)->tx_packets++;
+	siit_stats(skb2->dev)->tx_bytes += skb2->len;
 
 	/* Send packet to upper layer protocol */
 	netif_rx(skb2);
@@ -1358,76 +1756,299 @@ end:
 	return 0;
 }
 
-static bool header_ops_init = false;
-static struct header_ops siit_header_ops ____cacheline_aligned;
 
-static const struct net_device_ops siit_netdev_ops = {
+/*
+ * Transmit a packet received on siit6 (called by the kernel)
+ *
+ * siit_xmit6(skb, dev)
+ *
+ * where
+ * skb - pointer to struct sk_buff with incomed packet
+ * dev - pointer to struct device on which packet revieved
+ *
+ * Statistic:
+ * for all incoming packes:
+ *            stats.rx_bytes+=skb->len
+ *            stats.rx_packets++
+ * for packets we can't transle:
+ *            stats.tx_errors++
+ * device busy:
+ *            stats.tx_errors++
+ * for packets we can't allocate sk_buff:
+ *            stats.tx_dropped++
+ * for outgoing packes:
+ *            stats.tx_packets++
+ *            stats.tx_bytes+=skb2->len !!! But we don't set skb2->len !!!
+ */
+static int siit_xmit6(struct sk_buff *skb, struct net_device *dev)
+{
+	struct sk_buff *skb2 = NULL;/* pointer to new struct sk_buff for transleded packet */
+	struct ethhdr *eth_h;       /* pointer to incoming Ether header */
+	int len;                    /* original packets length */
+	int new_packet_len;
+	unsigned char mac[ETH_ALEN];
+	const char gwmac[] = GWMAC;
+	char new_packet_buff[2048];
+
+	/* Check pointer to sk_buff and device structs */
+	if (skb == NULL || dev == NULL)
+		return -EINVAL;
+
+	/* Add receive statistic */
+	siit_stats(dev)->rx_bytes += skb->len;
+	siit_stats(dev)->rx_packets++;
+
+	/* Upper layer (IP) protocol forms sk_buff for outgoing packet
+	 * and sets IP header + Ether header too. IP layer sets outgoing
+	 * device in sk_buff->dev.
+	 * In function (from linux/net/core/dev.c) ther is a call to
+	 * device transmit function (dev->hard_start_xmit):
+	 *
+	 *    dev_queue_xmit(struct sk_buff *skb)
+	 *    {
+	 *    ...
+	 *          device *dev = skb->dev;
+	 *    ...
+	 *          dev->hard_start_xmit(skb, dev);
+	 *    ...
+	 *    }
+	 * We save pointer to ether header in eth_h and skb_pull ether header
+	 * from data field of skb_buff
+	 */
+
+	if(!(siit_dev4->flags & IFF_UP))
+		return 0;
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,7,0)
+	netif_trans_update(siit_dev4);
+#else
+	dev->trans_start = jiffies;
+#endif
+
+	/*
+	 * IPv6 packet
+	 */
+	if (ntohs(skb->protocol) == ETH_P_IPV6) {
+
+#ifdef SIIT_DEBUG
+		siit_print_dump(skb->data, sizeof(struct ipv6hdr), "siit: (in) ip6_hdr dump");
+#endif
+		/* packet len = skb->data len*/
+		len = skb->len;
+
+		/* call translation function */
+		if ((new_packet_len = ip6_ip4(skb->data, len, new_packet_buff, 0, (unsigned char *)&mac)) == -1 )
+		{
+			PDEBUG("siit_xmit6(): error translation ipv6->ipv4, packet dropped.\n");
+			siit_stats(dev)->rx_dropped++;
+			goto end;
+		}
+
+		/* Allocate new sk_buff to compose translated packet */
+		skb2 = netdev_alloc_skb(siit_dev4, new_packet_len + dev->hard_header_len);
+		if (!skb2) {
+			printk(KERN_DEBUG "%s: alloc_skb failure, packet dropped.\n", siit_dev4->name);
+			siit_stats(dev)->rx_dropped++;
+			goto end;
+		}
+		memcpy(skb_put(skb2, new_packet_len + dev->hard_header_len), (char *)eth_h, dev->hard_header_len);
+		// Set MAC header
+		eth_h = (struct ethhdr *)skb2->data;
+		eth_h->h_proto = htons(ETH_P_IP);
+		memcpy(eth_h->h_dest, &mac, ETH_ALEN);
+		memcpy(eth_h->h_source, &gwmac, ETH_ALEN);
+		skb_reset_mac_header(skb2);
+		skb_pull(skb2, dev->hard_header_len);
+		// Copy IP packet
+		memcpy(skb2->data, new_packet_buff, new_packet_len);
+		skb2->protocol = htons(ETH_P_IP);
+		if(memcmp(&mac, siit_dev4->dev_addr, ETH_ALEN) == 0) {
+			skb2->pkt_type = PACKET_HOST;
+		} else {
+			skb2->pkt_type = PACKET_OTHERHOST;
+		}
+	}
+	else {
+		PDEBUG("siit_xmit6(): unsupported protocol family %x, packet dropped.\n", skb->protocol);
+		goto end;
+	}
+
+	/*
+	 * Set needed fields in new sk_buff
+	 */
+	
+	skb2->ip_summed = CHECKSUM_UNNECESSARY;
+
+	/* Add transmit statistic */
+	siit_stats(skb2->dev)->tx_packets++;
+	siit_stats(skb2->dev)->tx_bytes += skb2->len;
+
+	/* Send packet to upper layer protocol */
+	netif_rx(skb2);
+
+end:
+	dev_kfree_skb(skb);
+
+	return 0;
+}
+
+
+static bool header_ops_init = false;
+static struct header_ops siit_header_ops4 ____cacheline_aligned;
+static struct header_ops siit_header_ops6 ____cacheline_aligned;
+
+static const struct net_device_ops siit_netdev_ops4 = {
 	.ndo_open		= siit_open,
 	.ndo_stop		= siit_release,
-	.ndo_start_xmit		= siit_xmit,
+	.ndo_start_xmit		= siit_xmit4,
+};
+
+static const struct net_device_ops siit_netdev_ops6 = {
+	.ndo_open		= siit_open,
+	.ndo_stop		= siit_release,
+	.ndo_start_xmit		= siit_xmit6,
 };
 
 /*
- * The init function initialize of the SIIT device..
- * It is invoked by register_netdev()
+ * The init function is invoked by register_netdev()
  */
 
-static void
-siit_init(struct net_device *dev)
+static void siit_init4(struct net_device *dev)
 {
+	int i;
 	ether_setup(dev);    /* assign some of the fields */
 	random_ether_addr(dev->dev_addr);
+
+	for (i=0 ; i < 6 ; i++) 
+		dev->broadcast[i] = (unsigned char)15;
+
+	dev->hard_header_len = 14;
 
 	/*
 	 * Assign device function.
 	 */
-	dev->netdev_ops = &siit_netdev_ops;
-	dev->flags           |= IFF_NOARP;     /* ARP not used */
+	dev->netdev_ops = &siit_netdev_ops4;
 	dev->tx_queue_len = 10;
 
 	if (!header_ops_init) {
-		memcpy(&siit_header_ops, dev->header_ops, sizeof(struct header_ops));
-		siit_header_ops.cache = NULL;
+		memcpy(&siit_header_ops4, dev->header_ops, sizeof(struct header_ops));
+		siit_header_ops4.cache = NULL;
 	}
-	dev->header_ops = &siit_header_ops;
+
+	dev->header_ops = &siit_header_ops4;
+}
+
+static void siit_init6(struct net_device *dev)
+{
+	/*
+	 * Assign device function.
+	 */
+	dev->netdev_ops = &siit_netdev_ops6;
+	dev->type = ARPHRD_NONE;
+	dev->hard_header_len = 0;
+	dev->addr_len = 0;
+	dev->mtu = 1500;
+	dev->features = NETIF_F_NETNS_LOCAL;
+	dev->flags = IFF_NOARP | IFF_POINTOPOINT;
+	dev->tx_queue_len = 10;
+
+	if (!header_ops_init) {
+		memcpy(&siit_header_ops6, dev->header_ops, sizeof(struct header_ops));
+		siit_header_ops6.cache = NULL;
+	}
+
+	dev->header_ops = &siit_header_ops6;
 }
 
 /*
  * Finally, the module stuff
  */
-static struct net_device *siit_dev = NULL;
 
 int init_module(void)
 {
 	int res = -ENOMEM;
 	int priv_size;
 
+	res = create_siit_proc_entry();
+	if(res)
+		goto err_device;
+
 	priv_size = sizeof(struct header_ops);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(3,17,0)
-	siit_dev = alloc_netdev(priv_size, "siit%d", NET_NAME_UNKNOWN, siit_init);
+	siit_dev4 = alloc_netdev(priv_size, "siit4", NET_NAME_UNKNOWN, siit_init4);
+	siit_dev6 = alloc_netdev(priv_size, "siit6", NET_NAME_UNKNOWN, siit_init6);
 #else
-	siit_dev = alloc_netdev(priv_size, "siit%d", siit_init);
+	siit_dev4 = alloc_netdev(priv_size, "siit4", siit_init4);
+	siit_dev6 = alloc_netdev(priv_size, "siit6", siit_init6);
 #endif
-	if (!siit_dev)
+	if (!siit_dev4 || !siit_dev6)
+		goto err_device;
+
+	res = register_netdev(siit_dev4);
+	if (res) {
+		free_netdev(siit_dev4);
+		goto err_device;
+		}
+
+	res = register_netdev(siit_dev6);
+	if (res) {
+		free_netdev(siit_dev4);
+		free_netdev(siit_dev6);
+		goto err_device;
+		}
+	// Allocate slab cache
+	siit_cache = kmem_cache_create("siit", sizeof(siit_rule_t), 0, SLAB_HWCACHE_ALIGN, NULL, NULL);
+	if (!siit_cache) {
+		siit_cleanup();
+		goto err_alloc;
+	}
+	
+	// Allocate options
+	siit_options = (siit_options_t*)kmalloc(sizeof(siit_options_t), GFP_ATOMIC);
+	if (!siit_options)
 		goto err_alloc;
 
-	res = register_netdev(siit_dev);
-	if (res)
-		goto err_register;
-
+	// Allocate first translation rule
+	siit_options->firstrule = kmem_cache_alloc(siit_cache, GFP_ATOMIC);
+	if (!siit_options->firstrule)
+		goto err_alloc;
 	return 0;
 
-err_register:
-	free_netdev(siit_dev);
 err_alloc:
-	printk(KERN_ERR "Error creating siit device: %d\n", res);
+	printk(KERN_ERR "siit: error allocating memory.\n", res);
+	return res;
+err_device:
+	printk(KERN_ERR "siit: error creating siit devices: %d\n", res);
 	return res;
 }
 
 void cleanup_module(void)
 {
-	unregister_netdev(siit_dev);
-	free_netdev(siit_dev);
+	if (siit_dev6) {
+		unregister_netdev(siit_dev6);
+		free_netdev(siit_dev6);
+	}
+	if (siit_dev4) {
+		unregister_netdev(siit_dev4);
+		free_netdev(siit_dev4);
+	}
+	if (siit_proc_parent) {
+		if (siit_proc_entry) {
+			remove_proc_entry(SIIT_CONTROL_PROC_NAME, siit_proc_parent);
+		}
+		remove_proc_entry(SIIT_PROC_NAME, init_net.proc_net);
+	}
+
+for (i = 0; i < qset; i++)
+if (dptr->data[i])
+        kmem_cache_free(scullc_cache, dptr->data[i]);
+
+/* scullc_cleanup: release the cache of our quanta */
+if (scullc_cache)
+    kmem_cache_destroy(scullc_cache);
+
+
+	printk("siit: module unloaded.\n");
 }
 
 MODULE_LICENSE("GPL");
